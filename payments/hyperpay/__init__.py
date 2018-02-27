@@ -3,10 +3,9 @@ import re
 
 import requests
 from django.shortcuts import redirect
+
 from payments import PaymentStatus, PaymentError
 from payments.core import BasicProvider
-
-from saleor.userprofile.models import UserCard
 from .forms import PaymentForm
 
 logger = logging.getLogger(__name__)
