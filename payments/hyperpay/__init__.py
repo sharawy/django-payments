@@ -1,22 +1,28 @@
+import logging
+import re
+
 import requests
 from django.shortcuts import redirect
-from enum import Enum
-
 from payments import PaymentStatus, PaymentError
 from payments.core import BasicProvider
+
+from saleor.userprofile.models import UserCard
 from .forms import PaymentForm
+
+logger = logging.getLogger(__name__)
+
+# 4005550000000001 05/21 cvv2 123
+class PaymentType():
+    REFUND = 'RF'
+    CAPTURE = 'CP'
+    REVERSAL = 'RV'
+    DEBIT = "DB"
 
 
 class HyperPayProvider(BasicProvider):
-
-    class PaymentType(Enum):
-        REFUND = 'CP'
-        CAPTURE = 'RF'
-        REVERSAL = 'RV'
-
-    def __init__(self, entity_id, password,
+    def __init__(self, entity_id, password, user_id,
                  url='https://test.oppwa.com/v1/', **kwargs):
-        self.user_id = "8a8294185f5892cb015f6813d4e92732"
+        self.user_id = user_id
         self.password = password
         self.entity_id = entity_id
         self.url = url
@@ -41,49 +47,83 @@ class HyperPayProvider(BasicProvider):
                                       self.password,
                                       self.entity_id)
 
-    def _prepare_checkout(self, currency, shopper_result_url=None, amount=None, payment_type="DB"):
+    def success_payment_status(self, code):
+        return re.search(r"^(000\.000\.|000\.100\.1|000\.[36])", code) or \
+               re.search(r"^(000\.400\.0[^3]|000\.400\.100)", code)
+
+    def _prepare_checkout(self, merchant_id, currency, amount=None, payment_type=PaymentType.DEBIT):
         self.data['amount'] = amount
         self.data["paymentType"] = payment_type
         self.data["currency"] = currency
-        response = requests.post(self.url, self.data)
-        return response
+        self.data["merchantTransactionId"] = merchant_id
+
+        response = requests.post(self.checkout_url, self.data)
+        return response.json()
+
+    def _attach_saved_cards(self, registrations=[]):
+        for index, register_id in enumerate(registrations):
+            self.data["registrations[{}].id".format(str(index))] = register_id
 
     def get_form(self, payment, data=None):
-        response = self._prepare_checkout(currency=payment.currency, amount=payment.total)
-        if 'id' in response:
+        if data:
+             self._attach_saved_cards(registrations=data.get('registrations'))
+        response = self._prepare_checkout(merchant_id=payment.order.pk, currency=payment.currency, amount=payment.total)
+        if "id" in response:
             payment.transaction_id = response['id']
             payment.save()
-        form = PaymentForm(checkout_id=response['id'], payment=payment)
+        form = PaymentForm(checkout_id=response.get('id'), payment=payment)
         return form
 
     def process_data(self, payment, request):
-        success_url = payment.get_success_url()
-        response = requests.get(self._get_status_url())
-        return redirect(success_url)
+        response = requests.get(self._get_status_url(request.GET.get('id')))
+        result = response.json()
+        if response.status_code == 200:
+            if self.success_payment_status(result['result']['code']):
+                payment.change_status(PaymentStatus.CONFIRMED)
+                payment.captured_amount = payment.total
+                payment.extra_data = result
+                payment.transaction_id = result['id']
+                payment.save()
+                if "registrationId" in result:
+                    self._save_card(payment,result)
 
-    def _rebill(self, payment_id, amount, payment_type):
+                return redirect(payment.get_success_url())
+            else:
+                payment.change_status(PaymentStatus.REJECTED, result['result']['description'])
+                payment.extra_data = result
+                payment.save()
+        else:
+            logger.warning("HyperPay Error", extra={
+                'response': result,
+                'status_code': response.status_code})
+            payment.change_status(PaymentStatus.ERROR, result['result']['description'])
+        return redirect(payment.get_failure_url())
+
+    def _rebill(self, payment, amount, payment_type):
         self.data["amount"] = amount
         self.data["paymentType"] = payment_type
-        response = requests.post(self.rebill_url.format(payment_id), self.data)
+        self.data["currency"] = payment.currency
+        response = requests.post(self.rebill_url.format(payment.transaction_id), self.data)
         return response
 
     def refund(self, payment, amount):
-        response = self._rebill(payment=payment.transaction_id, amount=amount, payment_type=self.PaymentType.REFUND)
-        payment.change_status(PaymentStatus.REFUNDED)
+        response = self._rebill(payment=payment, amount=amount, payment_type=PaymentType.REFUND)
+        result = response.json()
+        if self.success_payment_status(result['result']['code']):
+            payment.change_status(PaymentStatus.REFUNDED)
+        else:
+            raise PaymentError(result['result']['description'])
         return amount
 
-    def capture(self, payment, amount=None):
-        response = self._rebill(payment=payment.transaction_id, amount=amount, payment_type=self.PaymentType.CAPTURE)
-
-        status = response['status']
-        if status == 'completed':
-            payment.change_status(PaymentStatus.CONFIRMED)
-            return amount
-        elif status in ['partially_captured', 'partially_refunded']:
-            return amount
-        elif status == 'pending':
-            payment.change_status(PaymentStatus.WAITING)
-        elif status == 'refunded':
-            payment.change_status(PaymentStatus.REFUNDED)
-            raise PaymentError('Payment already refunded')
-
+    # def _save_card(self, payment, resposne):
+    #     token = resposne["registrationId"]
+    #     card = resposne['card']
+    #     expiry_date = card["expiryYear"] + "-" + card["expiryMonth"]
+    #     user_card = UserCard()
+    #     user_card.token = token
+    #     user_card.expiry_date = expiry_date
+    #     user_card.last_4_digits = card["last4Digits"]
+    #     user_card.bin = card["bin"]
+    #     user_card.provider = "hyperpay"
+    #     user_card.save()
+    #     payment.order.user.payment_cards.add(user_card)

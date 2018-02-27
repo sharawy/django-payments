@@ -19,7 +19,7 @@ class BrandType:
 class PaymentForm(CreditCardPaymentFormWithName):
     def __init__(self, checkout_id, **kwargs):
         super(PaymentForm, self).__init__(**kwargs)
-        self.checkout_id = checkout_id
+        self.initial['checkout_id'] = checkout_id
 
     VALID_TYPES = ['visa', 'mastercard', 'amex']
     checkout_id = forms.CharField(max_length=48)
