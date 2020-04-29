@@ -84,7 +84,8 @@ class HyperPayProvider(BasicProvider):
                 payment.transaction_id = result['id']
                 payment.save()
                 if "registrationId" in result:
-                    self._save_card(payment,result)
+                    pass
+                    #self._save_card(payment,result)
 
                 return redirect(payment.get_success_url())
             else:
